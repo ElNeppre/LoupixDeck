@@ -10,15 +10,27 @@ namespace LoupixDeck.Services.ActiveWindow;
 /// line by line, the whole loop wrapped in try/catch so a missing <c>xprop</c> or a
 /// vanished X11 connection degrades silently to a no-op instead of crashing.
 ///
+/// Some compositors (observed under GNOME Shell/Mutter via XWayland) update
+/// <c>_NET_ACTIVE_WINDOW</c> without ever emitting the <c>PropertyNotify</c> that
+/// <c>-spy</c> relies on, which silently stalls the spy loop's <c>ReadLine()</c>
+/// after its first line. <see cref="PollTick"/> is a low-frequency fallback — a
+/// direct (non-spy) query on a timer, the same "poll as a safety net" pattern
+/// <c>AppSwitchingService</c> already uses for process-start detection — so focus
+/// changes still surface even when the compositor never notifies.
+///
 /// Pure Wayland sessions (no DISPLAY) are not covered — there is no portable
 /// foreground-window protocol across GNOME/KDE/wlroots, so we stay a no-op there.
 /// </summary>
 [SupportedOSPlatform("linux")]
 public sealed class LinuxActiveWindowMonitor : IActiveWindowMonitor, IDisposable
 {
+    private const int PollIntervalMs = 1500;
+
     public event EventHandler<ActiveWindowInfo> ActiveWindowChanged;
 
+    private readonly object _lock = new();
     private Process _proc;
+    private Timer _pollTimer;
     private bool _started;
     private string _lastWindowId;
     private (string Process, string Title) _last;
@@ -37,6 +49,7 @@ public sealed class LinuxActiveWindowMonitor : IActiveWindowMonitor, IDisposable
         }
 
         _ = Task.Run(Monitor);
+        _pollTimer = new Timer(_ => PollTick(), null, PollIntervalMs, PollIntervalMs);
     }
 
     private void Monitor()
@@ -61,8 +74,12 @@ public sealed class LinuxActiveWindowMonitor : IActiveWindowMonitor, IDisposable
                 // e.g. "_NET_ACTIVE_WINDOW(WINDOW): window id # 0x1a00007"
                 var windowId = ParseWindowId(line);
                 if (string.IsNullOrEmpty(windowId)) continue;
-                if (windowId == _lastWindowId) continue;
-                _lastWindowId = windowId;
+
+                lock (_lock)
+                {
+                    if (windowId == _lastWindowId) continue;
+                    _lastWindowId = windowId;
+                }
 
                 Resolve(windowId);
             }
@@ -70,6 +87,43 @@ public sealed class LinuxActiveWindowMonitor : IActiveWindowMonitor, IDisposable
         catch (Exception ex)
         {
             Console.WriteLine($"[AppSwitch] Linux monitor unavailable: {ex.Message}");
+        }
+    }
+
+    /// <summary>Direct (non-spy) poll: asks for the current value instead of waiting on a
+    /// notification, so it works regardless of whether the compositor sends PropertyNotify.</summary>
+    private void PollTick()
+    {
+        try
+        {
+            using var query = Process.Start(new ProcessStartInfo
+            {
+                FileName = "xprop",
+                Arguments = "-root _NET_ACTIVE_WINDOW",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+            if (query == null) return;
+
+            var line = query.StandardOutput.ReadLine();
+            query.WaitForExit();
+            if (string.IsNullOrEmpty(line)) return;
+
+            var windowId = ParseWindowId(line);
+            if (string.IsNullOrEmpty(windowId)) return;
+
+            lock (_lock)
+            {
+                if (windowId == _lastWindowId) return;
+                _lastWindowId = windowId;
+            }
+
+            Resolve(windowId);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[AppSwitch] active-window poll failed: {ex.Message}");
         }
     }
 
@@ -174,6 +228,7 @@ public sealed class LinuxActiveWindowMonitor : IActiveWindowMonitor, IDisposable
 
     public void Dispose()
     {
+        try { _pollTimer?.Dispose(); } catch { /* ignore */ }
         try { _proc?.Kill(); } catch { /* ignore */ }
         _proc?.Dispose();
     }
